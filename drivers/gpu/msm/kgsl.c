@@ -29,6 +29,7 @@
 #include <linux/sort.h>
 #include <linux/security.h>
 #include <linux/compat.h>
+#include <linux/show_mem_notifier.h>
 
 #include "kgsl.h"
 #include "kgsl_debugfs.h"
@@ -1808,9 +1809,9 @@ long kgsl_ioctl_drawctxt_create(struct kgsl_device_private *dev_priv,
 	/* Commit the pointer to the context in context_idr */
 	write_lock(&device->context_lock);
 	idr_replace(&device->context_idr, context, context->id);
+	param->drawctxt_id = context->id;
 	write_unlock(&device->context_lock);
 
-	param->drawctxt_id = context->id;
 done:
 	return result;
 }
@@ -2234,14 +2235,16 @@ static int kgsl_setup_dmabuf_useraddr(struct kgsl_device *device,
 		if (fd != 0)
 			dmabuf = dma_buf_get(fd - 1);
 	}
-	up_read(&current->mm->mmap_sem);
 
-	if (dmabuf == NULL)
+	if (dmabuf == NULL) {
+		up_read(&current->mm->mmap_sem);
 		return -ENODEV;
+	}
 
 	ret = kgsl_setup_dma_buf(device, pagetable, entry, dmabuf);
 	if (ret) {
 		dma_buf_put(dmabuf);
+		up_read(&current->mm->mmap_sem);
 		return ret;
 	}
 
@@ -2249,6 +2252,7 @@ static int kgsl_setup_dmabuf_useraddr(struct kgsl_device *device,
 	entry->memdesc.useraddr = hostptr;
 	_setup_cache_mode(entry, vma);
 
+	up_read(&current->mm->mmap_sem);
 	return 0;
 }
 #else
@@ -2285,7 +2289,7 @@ static long _gpuobj_map_useraddr(struct kgsl_device *device,
 		struct kgsl_mem_entry *entry,
 		struct kgsl_gpuobj_import *param)
 {
-	struct kgsl_gpuobj_import_useraddr useraddr;
+	struct kgsl_gpuobj_import_useraddr useraddr = {0};
 	int ret;
 
 	param->flags &= KGSL_MEMFLAGS_GPUREADONLY
@@ -2419,7 +2423,7 @@ long kgsl_ioctl_gpuobj_import(struct kgsl_device_private *dev_priv,
 		entry->memdesc.size);
 
 	trace_kgsl_mem_map(entry, fd);
-
+	
 	kgsl_mem_entry_commit_process(private, entry);
 	return 0;
 
@@ -4262,6 +4266,27 @@ void kgsl_device_platform_remove(struct kgsl_device *device)
 }
 EXPORT_SYMBOL(kgsl_device_platform_remove);
 
+static int kgsl_sharedmem_size_notifier(struct notifier_block *nb,
+					unsigned long is_simple, void *data)
+{
+	struct seq_file *s;
+
+	s = (struct seq_file *)data;
+	if (!is_simple)
+		return 0;
+	if (s != NULL)
+		seq_printf(s, "KgslSharedmem:  %8lu kB\n",
+			(unsigned long)(kgsl_driver.stats.page_alloc >> 10));
+	else
+		printk("KgslSharedmem:%lukB ",
+			(unsigned long)(kgsl_driver.stats.page_alloc >> 10));
+	return 0;
+}
+
+static struct notifier_block kgsl_sharedmem_size_nb = {
+	.notifier_call = kgsl_sharedmem_size_notifier,
+};
+
 static void kgsl_core_exit(void)
 {
 	kgsl_events_exit();
@@ -4288,6 +4313,7 @@ static void kgsl_core_exit(void)
 
 	kgsl_memfree_exit();
 	unregister_chrdev_region(kgsl_driver.major, KGSL_DEVICE_MAX);
+	show_mem_notifier_unregister(&kgsl_sharedmem_size_nb);
 }
 
 static int __init kgsl_core_init(void)
@@ -4361,6 +4387,8 @@ static int __init kgsl_core_init(void)
 		goto err;
 
 	kgsl_memfree_init();
+
+	show_mem_notifier_register(&kgsl_sharedmem_size_nb);
 
 	return 0;
 

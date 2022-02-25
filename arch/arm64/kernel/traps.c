@@ -32,14 +32,21 @@
 #include <linux/sched.h>
 #include <linux/syscalls.h>
 
+#include <asm/arch_timer.h>
 #include <asm/atomic.h>
+#include <asm/barrier.h>
 #include <asm/debug-monitors.h>
+#include <asm/esr.h>
 #include <asm/traps.h>
 #include <asm/stacktrace.h>
 #include <asm/exception.h>
 #include <asm/system_misc.h>
 #include <asm/esr.h>
 #include <asm/edac.h>
+
+#ifdef CONFIG_SEC_DEBUG
+#include <linux/qcom/sec_debug.h>
+#endif
 
 #include <trace/events/exception.h>
 
@@ -101,6 +108,31 @@ static void dump_backtrace_entry(unsigned long where, unsigned long stack)
 		dump_mem("", "Exception stack", stack,
 			 stack + sizeof(struct pt_regs));
 }
+
+#ifdef CONFIG_USER_RESET_DEBUG
+void sec_debug_backtrace(void)
+{
+	static int once = 0;
+	struct stackframe frame;
+
+	if (!once++) {
+		frame.fp = (unsigned long)__builtin_frame_address(0);
+		frame.sp = current_stack_pointer;
+		frame.pc = (unsigned long)sec_debug_backtrace;
+
+		while (1) {
+			int ret;
+
+			ret = unwind_frame(&frame);
+			if (ret < 0)
+				break;
+
+			_sec_debug_store_backtrace(frame.pc);
+		}
+	}
+}
+EXPORT_SYMBOL(sec_debug_backtrace);
+#endif
 
 static void dump_instr(const char *lvl, struct pt_regs *regs)
 {
@@ -211,6 +243,16 @@ static int __die(const char *str, int err, struct thread_info *thread,
 		 TASK_COMM_LEN, tsk->comm, task_pid_nr(tsk), thread + 1);
 
 	if (!user_mode(regs) || in_interrupt()) {
+#ifdef CONFIG_SEC_DEBUG
+		if (THREAD_SIZE + (unsigned long)task_stack_page(tsk) - regs->sp
+			> THREAD_SIZE) {
+			dump_mem(KERN_EMERG, "Stack: ", regs->sp,
+					THREAD_SIZE/4 + regs->sp);
+		} else {
+			dump_mem(KERN_EMERG, "Stack: ", regs->sp,
+					THREAD_SIZE + (unsigned long)task_stack_page(tsk));
+		}
+#endif
 		dump_backtrace(regs, tsk);
 		dump_instr(KERN_EMERG, regs);
 	}
@@ -228,6 +270,10 @@ static unsigned long oops_begin(void)
 	unsigned long flags;
 
 	oops_enter();
+
+#ifdef CONFIG_SEC_DEBUG
+	secdbg_sched_msg("!!die!!");
+#endif
 
 	/* racy, but better than risking deadlock. */
 	raw_local_irq_save(flags);
@@ -282,6 +328,10 @@ void die(const char *str, struct pt_regs *regs, int err)
 		bug_type = report_bug(regs->pc, regs);
 	if (bug_type != BUG_TRAP_TYPE_NONE)
 		str = "Oops - BUG";
+
+#ifdef CONFIG_SEC_DEBUG_SUMMARY
+	sec_debug_save_die_info(str, regs);
+#endif
 
 	ret = __die(str, err, thread, regs);
 
@@ -379,6 +429,38 @@ die_sig:
 	info.si_addr  = pc;
 
 	arm64_notify_die("Oops - undefined instruction", regs, &info, 0);
+}
+
+static void cntvct_read_handler(unsigned int esr, struct pt_regs *regs)
+{
+	int rt = (esr & ESR_ELx_SYS64_ISS_RT_MASK) >> ESR_ELx_SYS64_ISS_RT_SHIFT;
+
+	isb();
+	if (rt != 31)
+		regs->regs[rt] = arch_counter_get_cntvct();
+	regs->pc += 4;
+}
+
+static void cntfrq_read_handler(unsigned int esr, struct pt_regs *regs)
+{
+	int rt = (esr & ESR_ELx_SYS64_ISS_RT_MASK) >> ESR_ELx_SYS64_ISS_RT_SHIFT;
+
+	if (rt != 31)
+		asm volatile("mrs %0, cntfrq_el0" : "=r" (regs->regs[rt]));
+	regs->pc += 4;
+}
+
+asmlinkage void __exception do_sysinstr(unsigned int esr, struct pt_regs *regs)
+{
+	if ((esr & ESR_ELx_SYS64_ISS_SYS_OP_MASK) == ESR_ELx_SYS64_ISS_SYS_CNTVCT) {
+		cntvct_read_handler(esr, regs);
+		return;
+	} else if ((esr & ESR_ELx_SYS64_ISS_SYS_OP_MASK) == ESR_ELx_SYS64_ISS_SYS_CNTFRQ) {
+		cntfrq_read_handler(esr, regs);
+		return;
+	}
+
+	do_undefinstr(regs);
 }
 
 long compat_arm_syscall(struct pt_regs *regs);
